@@ -400,8 +400,9 @@ class GrandBlueDetector:
                 elif g > 160 and r < 105 and b < 105:
                     green_pts.append((x, y))
 
-        is_green = len(green_pts) >= 40 and len(green_pts) > len(red_pts)
-        is_red = len(red_pts) >= 40 and len(red_pts) >= len(green_pts)
+        # A real fish sprite has hundreds of points (real sprite has 800+ sampled points)
+        is_green = len(green_pts) >= 90 and len(green_pts) > len(red_pts)
+        is_red = len(red_pts) >= 90 and len(red_pts) >= len(green_pts)
 
         # Fish sprite must be present
         if not (is_green or is_red):
@@ -425,8 +426,8 @@ class GrandBlueDetector:
             return ReelGameState(is_active=False)
 
         best_cluster = max(clusters, key=len)
-        # A real fish sprite has >= 40 sampled points (real sprite has 600+), rejecting single-frame clicks/sparks
-        if len(best_cluster) < 40:
+        # A real fish sprite has >= 90 sampled points (real sprite has 600+), rejecting bobbers (30-70) and noise
+        if len(best_cluster) < 90:
             return ReelGameState(is_active=False)
 
         c_xs = [p[0] for p in best_cluster]
@@ -504,21 +505,25 @@ class GrandBlueDetector:
                 else:
                     slider_center = fish_x
             else:
-                # Slider width is ~140..185px. Require span_w >= 75 to reject narrow edge posts (~50-60px)
+                # Slider width is ~140..185px. Require span_w >= 70 to reject narrow edge posts (~50-60px)
                 valid_spans = [
                     s for s in spans
-                    if 75 <= s[2] <= 280
+                    if 70 <= s[2] <= 280
                 ]
                 if valid_spans:
                     # Choose span closest to ideal slider width (~155px)
                     best_span = min(valid_spans, key=lambda s: abs(s[2] - 155))
                     slider_center = (best_span[0] + best_span[1]) / 2.0
                 else:
-                    # Fallback if no span >= 75px: choose span closest to ideal slider width
-                    best_span = min(spans, key=lambda s: abs(s[2] - 155))
-                    slider_center = (best_span[0] + best_span[1]) / 2.0
+                    # CRITICAL: For a RED fish, the physical dark slider bar MUST be present on the track!
+                    # If no valid dark slider is found, it is a bobber or reflection in ocean, NOT a minigame.
+                    return ReelGameState(is_active=False)
         elif is_green:
             slider_center = fish_x
+
+        # Ensure red fish has a valid confirmed slider
+        if is_red and (slider_center is None or best_span is None or best_span[2] < 70):
+            return ReelGameState(is_active=False)
 
         if best_span is not None:
             slider_left = float(best_span[0])

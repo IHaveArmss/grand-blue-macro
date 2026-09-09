@@ -767,8 +767,8 @@ class TestCastAndRodSafety(unittest.TestCase):
                 self.shake_calls = 0
             def find_shake_button(self, img):
                 self.shake_calls += 1
-                if self.shake_calls == 1:
-                    return (50, 60)
+                if self.shake_calls in (1, 2):
+                    return (50, 60)  # prompt stays on screen for 2 frames as it fades
                 return None
             def analyze_reel_game(self, img):
                 if self.shake_calls >= 4:
@@ -790,11 +790,108 @@ class TestCastAndRodSafety(unittest.TestCase):
         bot._running = True
         result = bot._handle_shake((0, 0, 1920, 1080))
         self.assertTrue(result)
-        self.assertEqual(len(mock_input.clicks), 1, "Should have clicked the shake prompt exactly once")
+        self.assertEqual(len(mock_input.clicks), 1, "Duplicate frame of same prompt must be debounced and not clicked twice!")
         # Prompt clicked at shake_roi_x (153) + 50 = 203, shake_roi_y (43) + 60 = 103
         self.assertEqual(mock_input.clicks[0][:2], (153 + 50, 43 + 60))
-        self.assertGreater(len(mock_input.moves), 0, "Should have nudged mouse cursor away after clicking")
         self.assertTrue(os.path.exists("scratch/last_shake_click.png"), "Diagnostic snapshot of click must be saved")
+
+    def test_bobber_in_ocean_rejected_by_reel_analyzer(self):
+        """Verifies that a red bobber in blue ocean water does NOT trigger reel minigame."""
+        from PIL import ImageDraw
+        # Create blue ocean background (b > 120, r < 50)
+        bobber_img = Image.new("RGB", (1792, 615), (25, 75, 130))
+        draw = ImageDraw.Draw(bobber_img)
+        # Draw red bobber top: 25px x 25px ellipse
+        draw.ellipse([800, 300, 825, 325], fill=(220, 30, 30))
+        state = self.detector.analyze_reel_game(bobber_img)
+        self.assertFalse(state.is_active, "Bobber in ocean water must NEVER be detected as an active reel game")
+
+    def test_reel_game_preemption_during_cast(self):
+        """Verifies that _handle_cast immediately yields and transitions to REELING if reel minigame is active."""
+        from src.fishing_bot import FishingBot
+        from src.detector import ReelGameState, CastMeterState
+
+        class MockScreen:
+            def capture_roi(self, *args):
+                return Image.new("RGB", (100, 100), (0, 0, 0))
+            def get_cursor_position(self):
+                return (500, 500)
+            def focus_window(self, win):
+                pass
+
+        class MockInput:
+            def __init__(self):
+                self.m1_down = False
+            def mouse_down(self, btn):
+                self.m1_down = True
+            def mouse_up(self, btn):
+                self.m1_down = False
+            def mouse_move(self, *args):
+                pass
+            def release_all(self):
+                self.m1_down = False
+
+        class MockDetector:
+            def analyze_cast_progress(self, img):
+                return CastMeterState(detected=False)
+            def analyze_reel_game(self, img):
+                # Reel minigame is active!
+                return ReelGameState(is_active=True, fish_x=450.0)
+
+        mock_screen = MockScreen()
+        mock_input = MockInput()
+        mock_detector = MockDetector()
+        config = {"fishing": {"cast": {"max_hold_time": 1.0}}}
+        bot = FishingBot(mock_screen, mock_input, mock_detector, config)
+        bot._running = True
+
+        result = bot._handle_cast((0, 0, 1920, 1080))
+        self.assertEqual(result, "REELING", "Must return REELING when reel minigame is active")
+        self.assertFalse(mock_input.m1_down, "M1 must be released when reel game is preempted")
+
+    def test_shake_prompt_preemption_during_cast(self):
+        """Verifies that _handle_cast returns SHAKE and releases M1 if a SHAKE prompt is visible."""
+        from src.fishing_bot import FishingBot
+        from src.detector import ReelGameState, CastMeterState
+
+        class MockScreen:
+            def capture_roi(self, *args):
+                return Image.new("RGB", (100, 100), (0, 0, 0))
+            def get_cursor_position(self):
+                return (500, 500)
+            def focus_window(self, win):
+                pass
+
+        class MockInput:
+            def __init__(self):
+                self.m1_down = False
+            def mouse_down(self, btn):
+                self.m1_down = True
+            def mouse_up(self, btn):
+                self.m1_down = False
+            def mouse_move(self, *args):
+                pass
+            def release_all(self):
+                self.m1_down = False
+
+        class MockDetector:
+            def analyze_cast_progress(self, img):
+                return CastMeterState(detected=False)
+            def analyze_reel_game(self, img):
+                return ReelGameState(is_active=False)
+            def find_shake_button(self, img):
+                return (50, 50)  # SHAKE button visible!
+
+        mock_screen = MockScreen()
+        mock_input = MockInput()
+        mock_detector = MockDetector()
+        config = {"fishing": {"cast": {"max_hold_time": 1.0}}}
+        bot = FishingBot(mock_screen, mock_input, mock_detector, config)
+        bot._running = True
+
+        result = bot._handle_cast((0, 0, 1920, 1080))
+        self.assertEqual(result, "SHAKE", "Must return SHAKE when a shake prompt is on screen")
+        self.assertFalse(mock_input.m1_down, "M1 must not be held down when shake prompt is preempted")
 
 
 if __name__ == "__main__":

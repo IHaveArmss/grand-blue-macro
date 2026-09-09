@@ -3,7 +3,7 @@
 import os
 import time
 import threading
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 try:
     from .screen import ScreenCapture
     from .input_manager import InputManager
@@ -134,6 +134,30 @@ class FishingBot:
             self.screen.focus_window(self._game_win)
         time.sleep(0.02)
 
+    def _get_shake_roi(self, game_rect) -> Tuple[int, int, int, int]:
+        """Resolves the shake scanning area (custom user ROI or default play area)."""
+        shake_cfg = self.config.get("fishing", {}).get("shake", {})
+        custom_roi = shake_cfg.get("custom_roi")
+        if custom_roi and len(custom_roi) == 4:
+            return tuple(int(v) for v in custom_roi)
+        gx, gy, gw, gh = game_rect
+        return (
+            gx + int(0.08 * gw),
+            gy + int(0.04 * gh),
+            int(0.90 * gw),
+            int(0.89 * gh),
+        )
+
+    def _get_reel_roi(self, game_rect) -> Tuple[int, int, int, int]:
+        """Resolves the reeling minigame bar area."""
+        gx, gy, gw, gh = game_rect
+        return (
+            gx + int(0.15 * gw),
+            gy + int(0.40 * gh),
+            int(0.70 * gw),
+            int(0.45 * gh),
+        )
+
     def _run_loop(self):
         self.set_status("STARTING")
         time.sleep(0.3)
@@ -143,32 +167,75 @@ class FishingBot:
                 rect = self._locked_rect
                 gx, gy, gw, gh = rect
 
+                reel_roi = self._get_reel_roi(rect)
+                shake_roi = self._get_shake_roi(rect)
+
+                # Preemption Check 1: If reel minigame is active, reel immediately!
+                pre_reel = self.screen.capture_roi(*reel_roi)
+                if self.detector.analyze_reel_game(pre_reel).is_active:
+                    self.log("[LOOP] Active reel minigame detected before cast! Jumping directly to Reeling...")
+                    self._handle_reeling(rect)
+                    continue
+
+                # Preemption Check 2: If SHAKE prompt is active, shake immediately!
+                pre_shake = self.screen.capture_roi(*shake_roi)
+                if self.detector.find_shake_button(pre_shake):
+                    self.log("[LOOP] Active SHAKE prompt detected before cast! Rod is in water. Jumping to Lure/Shake...")
+                    reeling_ready = self._handle_shake(rect)
+                    if reeling_ready and self._running:
+                        self._handle_reeling(rect)
+                    continue
+
                 # Stage 0: Verify / Equip Rod
                 self._handle_equip_rod(rect)
                 if not self._running:
                     break
 
-                # Stage 1: Cast
-                cast_ok = self._handle_cast(rect)
-                if not self._running:
-                    break
-
-                # If cast failed (e.g. rod was not in hand or click did not register), retry equip safely
-                if not cast_ok:
-                    self.log("[BOT] Cast failed. Skipping lure/shake phase and retrying rod equip...")
-                    time.sleep(0.5)
+                # Post-equip Preemption Checks
+                if self.detector.analyze_reel_game(self.screen.capture_roi(*reel_roi)).is_active:
+                    self.log("[LOOP] Active reel minigame detected after equip! Jumping directly to Reeling...")
+                    self._handle_reeling(rect)
                     continue
 
-                # Stage 2: Lure & Shake
-                reeling_ready = self._handle_shake(rect)
+                if self.detector.find_shake_button(self.screen.capture_roi(*shake_roi)):
+                    self.log("[LOOP] Active SHAKE prompt detected after equip! Rod is in water. Jumping to Lure/Shake...")
+                    reeling_ready = self._handle_shake(rect)
+                    if reeling_ready and self._running:
+                        self._handle_reeling(rect)
+                    continue
+
+                # Stage 1: Cast
+                cast_result = self._handle_cast(rect)
                 if not self._running:
                     break
 
-                # Stage 3: Reeling Minigame
-                if reeling_ready:
+                if cast_result == "REELING":
                     self._handle_reeling(rect)
-                    if not self._running:
-                        break
+                    continue
+
+                if cast_result == "SHAKE":
+                    reeling_ready = self._handle_shake(rect)
+                    if reeling_ready and self._running:
+                        self._handle_reeling(rect)
+                    continue
+
+                # Stage 2: Lure & Shake (Always proceed to shake, never skip it!)
+                uncertain = (cast_result is False)
+                reeling_ready = self._handle_shake(rect, uncertain_cast=uncertain)
+                if not self._running:
+                    break
+
+                # If lure/shake timed out without fish hook and cast was uncertain, retry equip
+                if not reeling_ready:
+                    if uncertain:
+                        self.log("[BOT] No shake prompt appeared after uncertain cast. Retrying rod equip...")
+                        time.sleep(0.5)
+                    continue
+
+                # Stage 3: Reeling Minigame
+                self._handle_reeling(rect)
+                if not self._running:
+                    break
 
                 # Stage 4: Cooldown
                 self.set_status("COOLDOWN")
@@ -275,6 +342,23 @@ class FishingBot:
         cast_roi_w = int(0.35 * gw)
         cast_roi_h = int(0.65 * gh)
 
+        reel_roi = self._get_reel_roi(game_rect)
+        shake_roi = self._get_shake_roi(game_rect)
+
+        # Preemption Check 1: Is the reel minigame ALREADY active on screen before pressing M1?
+        pre_bar = self.screen.capture_roi(*reel_roi)
+        if self.detector.analyze_reel_game(pre_bar).is_active:
+            self._rod_equipped = True
+            self.log("[CAST] Reel minigame already active on screen! Skipping cast to Reel immediately...")
+            return "REELING"
+
+        # Preemption Check 2: Is a SHAKE prompt ALREADY visible on screen?
+        pre_shake = self.screen.capture_roi(*shake_roi)
+        if self.detector.find_shake_button(pre_shake):
+            self._rod_equipped = True
+            self.log("[CAST] SHAKE prompt already visible on screen! Rod is in water. Entering Lure/Shake immediately...")
+            return "SHAKE"
+
         t_start = time.time()
         self.input.mouse_down(1)
         last_log_t = 0.0
@@ -298,6 +382,22 @@ class FishingBot:
                     self.log(f"[CAST] Max hold time ({max_hold:.2f}s) reached with NO cast meter detected (best={best_fill_pct:.1f}%). Releasing M1.")
                     cast_success = False
                 break
+
+            # Watchdog during M1 hold: sample periodically
+            if elapsed >= 0.10 and int(elapsed * 100) % 7 == 0:
+                bar_crop = self.screen.capture_roi(*reel_roi)
+                if self.detector.analyze_reel_game(bar_crop).is_active:
+                    self.input.mouse_up(1)
+                    self._rod_equipped = True
+                    self.log("[CAST] Reel minigame detected during cast hold! Fish hooked! Transitioning to Reeling...")
+                    return "REELING"
+
+                shake_crop = self.screen.capture_roi(*shake_roi)
+                if self.detector.find_shake_button(shake_crop):
+                    self.input.mouse_up(1)
+                    self._rod_equipped = True
+                    self.log("[CAST] SHAKE prompt detected during cast hold! Rod is in water. Transitioning to Shake...")
+                    return "SHAKE"
 
             cast_crop = self.screen.capture_roi(cast_roi_x, cast_roi_y, cast_roi_w, cast_roi_h)
             state = self.detector.analyze_cast_progress(cast_crop)
@@ -382,95 +482,114 @@ class FishingBot:
             time.sleep(0.04)
             return True
         else:
-            self.log("[CAST] Warning: No cast meter appeared during M1 hold! Rod may not be equipped. Aborting to re-equip.")
-            self._rod_equipped = False
+            # Post-check 1: Did reel minigame appear upon release?
+            post_bar = self.screen.capture_roi(*reel_roi)
+            if self.detector.analyze_reel_game(post_bar).is_active:
+                self._rod_equipped = True
+                self.log("[CAST] Active reel minigame detected upon release! Fish hooked! Transitioning to Reeling...")
+                return "REELING"
+
+            # Post-check 2: Did a SHAKE prompt appear upon release?
+            post_shake = self.screen.capture_roi(*shake_roi)
+            if self.detector.find_shake_button(post_shake):
+                self._rod_equipped = True
+                self.log("[CAST] Active SHAKE prompt detected upon release! Rod is in water. Transitioning to Shake...")
+                return "SHAKE"
+
+            self.log("[CAST] No cast meter detected during M1 hold. Entering Lure/Shake to check for bobber...")
             return False
 
-    def _handle_shake(self, game_rect) -> bool:
+    def _handle_shake(self, game_rect, uncertain_cast: bool = False) -> bool:
         """Clicks SHAKE buttons until reel minigame appears or timeout."""
         self.set_status("LURING_SHAKE")
         shake_cfg = self.config.get("fishing", {}).get("shake", {})
         click_delay = shake_cfg.get("click_delay", 0.08)
-        max_wait = shake_cfg.get("max_wait_seconds", 25.0)
+        base_max_wait = shake_cfg.get("max_wait_seconds", 25.0)
+        max_wait = 5.0 if uncertain_cast else base_max_wait
 
         gx, gy, gw, gh = game_rect
         t_start = time.time()
         last_log_t = 0.0
         scan_count = 0
 
-        custom_roi = shake_cfg.get("custom_roi")
-        if custom_roi and len(custom_roi) == 4:
-            self.log(f"[LURE] Bobber in water. Scanning CUSTOM area (pos=({custom_roi[0]}, {custom_roi[1]}), size={custom_roi[2]}x{custom_roi[3]})...")
+        shake_roi = self._get_shake_roi(game_rect)
+        reel_roi = self._get_reel_roi(game_rect)
+        shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h = shake_roi
+
+        if shake_cfg.get("custom_roi"):
+            self.log(f"[LURE] Bobber in water. Scanning CUSTOM area (pos=({shake_roi_x}, {shake_roi_y}), size={shake_roi_w}x{shake_roi_h})...")
         else:
             self.log("[LURE] Bobber in water. Scanning play area for circular SHAKE prompts...")
 
         consecutive_reel_frames = 0
         last_fish_x = None
+        last_clicked_x = None
+        last_clicked_y = None
+        last_clicked_t = 0.0
 
         while self._running:
             elapsed = time.time() - t_start
             if elapsed > max_wait:
-                self.log(f"[LURE] Lure phase timed out ({max_wait}s without fish hook). Returning to equip/cast.")
+                if uncertain_cast:
+                    self.log(f"[LURE] No shake prompt detected within {max_wait:.1f}s after unconfirmed cast. Returning to equip.")
+                else:
+                    self.log(f"[LURE] Lure phase timed out ({max_wait:.1f}s without fish hook). Returning to equip/cast.")
                 return False
 
             scan_count += 1
-
-            # Determine Shake ROI: Custom Region or Default Water Play Area
-            if custom_roi and len(custom_roi) == 4:
-                shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h = [int(v) for v in custom_roi]
-                play_img = self.screen.capture_roi(shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h)
-            else:
-                shake_roi_x = gx + int(0.08 * gw)
-                shake_roi_y = gy + int(0.04 * gh)
-                shake_roi_w = int(0.90 * gw)
-                shake_roi_h = int(0.89 * gh)
-                play_img = self.screen.capture_roi(shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h)
+            play_img = self.screen.capture_roi(*shake_roi)
 
             # Step 1: Check for circular SHAKE prompts (highest priority - click immediately upon spawning!)
             shake_pt = self.detector.find_shake_button(play_img)
             if shake_pt:
+                # Prompt detected! Rod is definitely cast in water: reset to full max_wait
+                if uncertain_cast:
+                    uncertain_cast = False
+                    max_wait = base_max_wait
                 click_x = shake_roi_x + shake_pt[0]
                 click_y = shake_roi_y + shake_pt[1]
-                self.log(f"[LURE] SHAKE circle DETECTED at ({click_x}, {click_y})! Auto-clicking center...")
-                self.input.mouse_click(click_x, click_y, button=1, delay=click_delay)
-                # Diagnostic snapshot of the clicked prompt
-                try:
-                    import os
-                    from PIL import ImageDraw
-                    os.makedirs("scratch", exist_ok=True)
-                    click_vis = play_img.copy()
-                    draw = ImageDraw.Draw(click_vis)
-                    px, py = shake_pt
-                    draw.ellipse([px - 15, py - 15, px + 15, py + 15], outline=(0, 255, 0), width=3)
-                    click_vis.save("scratch/last_shake_click.png")
-                except Exception:
-                    pass
-                # Immediately nudge mouse cursor away so subsequent prompts in the same spot are never occluded!
-                self.input.mouse_move(click_x + 60, click_y + 40)
-                time.sleep(0.10)  # Quick debounce so subsequent prompts are clicked immediately
-                continue
 
-            # Step 2: Check if reel minigame has started
-            if custom_roi and len(custom_roi) == 4:
-                bar_roi_x = gx + int(0.15 * gw)
-                bar_roi_y = gy + int(0.40 * gh)
-                bar_roi_w = int(0.70 * gw)
-                bar_roi_h = int(0.45 * gh)
-                check_img = self.screen.capture_roi(bar_roi_x, bar_roi_y, bar_roi_w, bar_roi_h)
-            else:
-                rel_x = (gx + int(0.15 * gw)) - shake_roi_x
-                rel_y = (gy + int(0.40 * gh)) - shake_roi_y
-                rel_w = int(0.70 * gw)
-                rel_h = int(0.45 * gh)
-                c_x1 = max(0, min(rel_x, play_img.width - 1))
-                c_y1 = max(0, min(rel_y, play_img.height - 1))
-                c_x2 = max(c_x1 + 1, min(c_x1 + rel_w, play_img.width))
-                c_y2 = max(c_y1 + 1, min(c_y1 + rel_h, play_img.height))
-                check_img = play_img.crop((c_x1, c_y1, c_x2, c_y2))
+                # Prevent double-clicking the same prompt while it plays its fade-out animation
+                now = time.time()
+                is_duplicate = (
+                    last_clicked_x is not None
+                    and (now - last_clicked_t < 0.6)
+                    and abs(click_x - last_clicked_x) < 80
+                    and abs(click_y - last_clicked_y) < 80
+                )
+
+                if not is_duplicate:
+                    last_clicked_x = click_x
+                    last_clicked_y = click_y
+                    last_clicked_t = now
+
+                    self.log(f"[LURE] SHAKE circle DETECTED at ({click_x}, {click_y})! Auto-clicking center...")
+                    self.input.mouse_click(click_x, click_y, button=1, delay=click_delay)
+                    # Diagnostic snapshot of the clicked prompt
+                    try:
+                        import os
+                        from PIL import ImageDraw
+                        os.makedirs("scratch", exist_ok=True)
+                        click_vis = play_img.copy()
+                        draw = ImageDraw.Draw(click_vis)
+                        px, py = shake_pt
+                        draw.ellipse([px - 15, py - 15, px + 15, py + 15], outline=(0, 255, 0), width=3)
+                        click_vis.save("scratch/last_shake_click.png")
+                    except Exception:
+                        pass
+                    time.sleep(0.04)  # Brief yield for click to register without twitching cursor
+                    continue
+                else:
+                    # Prompt is still fading out. Yield briefly and keep scanning for next prompt.
+                    time.sleep(0.03)
+                    continue
+
+            # Step 2: Check if reel minigame has started (only when no prompt is present)
+            check_img = self.screen.capture_roi(*reel_roi)
 
             reel_state = self.detector.analyze_reel_game(check_img)
             if reel_state.is_active:
-                if last_fish_x is None or abs(reel_state.fish_x - last_fish_x) < 80:
+                if last_fish_x is None or abs(reel_state.fish_x - last_fish_x) < 180:
                     consecutive_reel_frames += 1
                 else:
                     consecutive_reel_frames = 1
@@ -550,9 +669,12 @@ class FishingBot:
             if not state.is_active:
                 inactive_frames += 1
                 if inactive_frames >= max_inactive_frames:
-                    self.catches += 1
-                    self.log(f"[CATCH] Reel bar disappeared. Fish successfully caught! Total catches: {self.catches}")
-                    self.set_status("FISH_CAUGHT", {"catches": self.catches})
+                    if time.time() - t_reel_start >= 1.0:
+                        self.catches += 1
+                        self.log(f"[CATCH] Reel bar disappeared. Fish successfully caught! Total catches: {self.catches}")
+                        self.set_status("FISH_CAUGHT", {"catches": self.catches})
+                    else:
+                        self.log("[REEL] Reel minigame ended early (<1.0s). Ending reeling phase.")
                     break
             else:
                 inactive_frames = 0
