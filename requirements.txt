@@ -1,0 +1,4 @@
+# Core dependencies for Grand Blue Macro
+Pillow>=10.2.0
+python-xlib>=0.33
+PyGObject>=3.48.0

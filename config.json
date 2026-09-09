@@ -1,0 +1,58 @@
+{
+  "hotkeys": {
+    "toggle_macro": "F6",
+    "calibrate": "F7",
+    "quit": "F8"
+  },
+  "fishing": {
+    "rod_slot": "9",
+    "verify_rod_equipped": true,
+    "assume_rod_equipped_on_start": true,
+    "auto_equip_on_start": false,
+    "equip_key_delay": 0.25,
+    "cast": {
+      "max_hold_time": 1.4,
+      "min_hold_time": 0.25,
+      "fill_threshold": 16,
+      "check_interval": 0.005
+    },
+    "shake": {
+      "click_delay": 0.08,
+      "max_wait_seconds": 25.0,
+      "scan_interval": 0.015,
+      "custom_roi": null
+    },
+    "reeling": {
+      "steering_mode": "deepfish_precision",
+      "target_mode": "fish_sprite",
+      "kp": 0.5,
+      "kd": 0.3,
+      "velocity_smoothing": 0.2,
+      "stopping_distance_multiplier": 3.0,
+      "sidebar_ratio": 0.8,
+      "stable_right_mult": 2.1,
+      "stable_right_div": 1.4,
+      "stable_left_mult": 1.1,
+      "stable_left_div": 1.0,
+      "ankle_break_right_mult": 1.0,
+      "ankle_break_left_mult": 0.9,
+      "deadzone_px": 15,
+      "green_feather_hold_ms": 35,
+      "green_feather_release_ms": 50,
+      "red_direction_hold_step_ms": 30,
+      "update_interval": 0.01,
+      "max_duration_seconds": 45.0
+    },
+    "cooldown_between_casts": 1.5
+  },
+  "display": {
+    "mode": "monitor_DP-2",
+    "window_title_filter": [
+      "Roblox",
+      "Sober"
+    ],
+    "auto_detect_window": true,
+    "target_region": null
+  },
+  "active_module": "fishing"
+}
