@@ -1,12 +1,20 @@
-"""Screen capture and window management utility for X11 on Linux."""
+"""Screen capture and window management utility (cross-platform Linux X11 and Windows)."""
 
+import sys
 import time
 from typing import Optional, Tuple, List, Union
 from PIL import Image
-from Xlib import display, X, Xatom
+
+if sys.platform != "win32":
+    try:
+        from Xlib import display, X, Xatom
+    except ImportError:
+        display = None
+        X = None
+        Xatom = None
 
 
-class ScreenCapture:
+class LinuxScreenCapture:
     def __init__(self, display_name: Optional[str] = None):
         self.d = display.Display(display_name)
         self.screen = self.d.screen()
@@ -152,6 +160,139 @@ class ScreenCapture:
         except Exception:
             geom = win.get_geometry()
             return geom.x, geom.y, geom.width, geom.height
+
+
+class WindowsScreenCapture:
+    """High-speed screen capture and window management utility for Windows using mss and Win32."""
+
+    def __init__(self, display_name: Optional[str] = None):
+        import ctypes
+        import mss
+        self.user32 = ctypes.windll.user32
+        self.sct = mss.mss()
+        self._screen_width = self.user32.GetSystemMetrics(0)   # SM_CXSCREEN
+        self._screen_height = self.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+
+    @property
+    def screen_size(self) -> Tuple[int, int]:
+        return self._screen_width, self._screen_height
+
+    def get_monitors(self) -> List[dict]:
+        """Queries mss for monitor geometries."""
+        monitors = []
+        try:
+            for i, m in enumerate(self.sct.monitors[1:], 1):
+                monitors.append({
+                    "name": f"Display-{i}",
+                    "x": m["left"],
+                    "y": m["top"],
+                    "w": m["width"],
+                    "h": m["height"]
+                })
+        except Exception:
+            pass
+        if not monitors:
+            monitors.append({"name": "Default", "x": 0, "y": 0, "w": self._screen_width, "h": self._screen_height})
+        return monitors
+
+    def get_cursor_position(self) -> Tuple[int, int]:
+        import ctypes
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+        pt = POINT()
+        self.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
+
+    def get_monitor_under_cursor(self) -> Tuple[int, int, int, int]:
+        cx, cy = self.get_cursor_position()
+        for m in self.get_monitors():
+            if m["x"] <= cx < (m["x"] + m["w"]) and m["y"] <= cy < (m["y"] + m["h"]):
+                return m["x"], m["y"], m["w"], m["h"]
+        m0 = self.get_monitors()[0]
+        return m0["x"], m0["y"], m0["w"], m0["h"]
+
+    def capture_roi(self, x: int, y: int, width: int, height: int) -> Image.Image:
+        """Capture a sub-rectangle of the screen in sub-millisecond time via mss."""
+        monitor = {
+            "top": int(y),
+            "left": int(x),
+            "width": max(1, int(width)),
+            "height": max(1, int(height))
+        }
+        sct_img = self.sct.grab(monitor)
+        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+    def capture_full(self) -> Image.Image:
+        """Capture the entire virtual desktop."""
+        monitor = self.sct.monitors[0]
+        sct_img = self.sct.grab(monitor)
+        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+    def find_window_with_obj(self, title_filters=("Roblox", "Sober")):
+        import ctypes
+        if isinstance(title_filters, str):
+            filters = [title_filters.lower()]
+        else:
+            filters = [str(f).lower() for f in title_filters]
+
+        matches = []
+        def enum_proc(hwnd, lParam):
+            if self.user32.IsWindowVisible(hwnd):
+                length = self.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    self.user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.lower()
+                    if any(f in title for f in filters):
+                        matches.append(hwnd)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        self.user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+
+        if matches:
+            hwnd = matches[0]
+            geom = self.get_window_geometry(hwnd)
+            return hwnd, geom
+        return None, None
+
+    def find_window(self, title_filters=("Roblox", "Sober")) -> Optional[Tuple[int, int, int, int]]:
+        _, geom = self.find_window_with_obj(title_filters)
+        return geom
+
+    def focus_window(self, win):
+        try:
+            self.user32.SetForegroundWindow(win)
+            self.user32.BringWindowToTop(win)
+        except Exception:
+            pass
+
+    def get_active_window(self) -> Optional[Tuple[int, int, int, int]]:
+        try:
+            hwnd = self.user32.GetForegroundWindow()
+            if hwnd:
+                return self.get_window_geometry(hwnd)
+        except Exception:
+            pass
+        return None
+
+    def get_window_geometry(self, win) -> Tuple[int, int, int, int]:
+        import ctypes
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+        rect = RECT()
+        self.user32.GetWindowRect(win, ctypes.byref(rect))
+        w = max(1, rect.right - rect.left)
+        h = max(1, rect.bottom - rect.top)
+        return rect.left, rect.top, w, h
+
+
+# Export platform-appropriate ScreenCapture class
+if sys.platform == "win32":
+    ScreenCapture = WindowsScreenCapture
+else:
+    ScreenCapture = LinuxScreenCapture
 
 
 if __name__ == "__main__":

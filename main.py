@@ -17,7 +17,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 # Auto-switch to .venv if available and not already in a virtualenv
-venv_python = os.path.join(PROJECT_ROOT, ".venv", "bin", "python3")
+if sys.platform == "win32":
+    venv_python = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
+else:
+    venv_python = os.path.join(PROJECT_ROOT, ".venv", "bin", "python3")
+
 if os.path.exists(venv_python) and sys.prefix == sys.base_prefix:
     os.execv(venv_python, [venv_python] + sys.argv)
 
@@ -44,8 +48,13 @@ load_dotenv()
 
 
 def run_gui():
-    from src.gui import main as gui_main
-    gui_main()
+    try:
+        from src.gui import main as gui_main
+        gui_main()
+    except (ImportError, ModuleNotFoundError) as e:
+        print(f"[NOTE] GUI framework (PyGObject/GTK3) is not available: {e}")
+        print("[NOTE] Automatically falling back to CLI mode...\n")
+        run_cli()
 
 
 def run_cli():
