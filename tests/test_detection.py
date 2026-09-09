@@ -625,6 +625,59 @@ class TestCastAndRodSafety(unittest.TestCase):
         bot._handle_equip_rod((0, 0, 1920, 1080))
         self.assertEqual(len(mock_input.tapped_keys), 0, "Bot must NEVER tap hotkey when rod is in hand!")
 
+    def test_shake_debounce_deflects_transient_frame(self):
+        """Verifies _handle_shake ignores a 1-frame transient reel trigger and requires 3 consecutive frames."""
+        from src.fishing_bot import FishingBot
+        from src.detector import ReelGameState
+
+        class MockScreen:
+            def capture_roi(self, *args):
+                return Image.new("RGB", (100, 100), (0, 0, 0))
+            def get_cursor_position(self):
+                return (500, 500)
+            def focus_window(self, win):
+                pass
+
+        class MockInput:
+            def mouse_click(self, *args, **kwargs):
+                pass
+            def mouse_move(self, *args):
+                pass
+            def release_all(self):
+                pass
+
+        class MockDetector:
+            def __init__(self):
+                self.calls = 0
+            def analyze_reel_game(self, img):
+                self.calls += 1
+                if self.calls == 1:
+                    return ReelGameState(is_active=True, fish_x=500.0)
+                elif self.calls == 2:
+                    return ReelGameState(is_active=False)
+                elif self.calls in (3, 4, 5):
+                    return ReelGameState(is_active=True, fish_x=500.0)
+                return ReelGameState(is_active=False)
+            def find_shake_button(self, img):
+                return None
+
+        mock_screen = MockScreen()
+        mock_input = MockInput()
+        mock_detector = MockDetector()
+        config = {
+            "fishing": {
+                "shake": {
+                    "click_delay": 0.01,
+                    "max_wait_seconds": 1.0,
+                }
+            }
+        }
+        bot = FishingBot(mock_screen, mock_input, mock_detector, config)
+        bot._running = True
+        result = bot._handle_shake((0, 0, 1920, 1080))
+        self.assertTrue(result, "Should successfully transition after 3 consecutive frames")
+        self.assertEqual(mock_detector.calls, 5, f"Expected 5 calls due to debounce, got {mock_detector.calls}")
+
 
 if __name__ == "__main__":
     unittest.main()

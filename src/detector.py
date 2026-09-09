@@ -298,8 +298,8 @@ class GrandBlueDetector:
                 elif g > 160 and r < 105 and b < 105:
                     green_pts.append((x, y))
 
-        is_green = len(green_pts) >= 20 and len(green_pts) > len(red_pts)
-        is_red = len(red_pts) >= 20 and len(red_pts) >= len(green_pts)
+        is_green = len(green_pts) >= 40 and len(green_pts) > len(red_pts)
+        is_red = len(red_pts) >= 40 and len(red_pts) >= len(green_pts)
 
         # Fish sprite must be present
         if not (is_green or is_red):
@@ -308,23 +308,35 @@ class GrandBlueDetector:
         pts = green_pts if is_green else red_pts
 
         # Filter out stray pixels, health bar, or floating text via spatial clustering
-        if len(pts) > 60:
-            clusters: List[List[Tuple[int, int]]] = []
-            for pt in pts:
-                matched = False
-                for c in clusters:
-                    if abs(pt[0] - c[0][0]) < 40 and abs(pt[1] - c[0][1]) < 30:
-                        c.append(pt)
-                        matched = True
-                        break
-                if not matched:
-                    clusters.append([pt])
-            # Largest cluster is the fish sprite
-            if clusters:
-                pts = max(clusters, key=len)
+        clusters: List[List[Tuple[int, int]]] = []
+        for pt in pts:
+            matched = False
+            for c in clusters:
+                if abs(pt[0] - c[0][0]) < 45 and abs(pt[1] - c[0][1]) < 35:
+                    c.append(pt)
+                    matched = True
+                    break
+            if not matched:
+                clusters.append([pt])
 
-        fish_x = sum(p[0] for p in pts) / len(pts)
-        fish_y = sum(p[1] for p in pts) / len(pts)
+        if not clusters:
+            return ReelGameState(is_active=False)
+
+        best_cluster = max(clusters, key=len)
+        # A real fish sprite has >= 40 sampled points (real sprite has 600+), rejecting single-frame clicks/sparks
+        if len(best_cluster) < 40:
+            return ReelGameState(is_active=False)
+
+        c_xs = [p[0] for p in best_cluster]
+        c_ys = [p[1] for p in best_cluster]
+        cw = max(c_xs) - min(c_xs)
+        ch = max(c_ys) - min(c_ys)
+        # Sprite dimensions: width 16..160, height 8..80
+        if not (16 <= cw <= 160 and 8 <= ch <= 80):
+            return ReelGameState(is_active=False)
+
+        fish_x = sum(c_xs) / len(best_cluster)
+        fish_y = sum(c_ys) / len(best_cluster)
 
         # Verify physical blue water bar exists along the fish corridor
         # This completely rejects false triggers from catch popups, clothing, and water reflections!

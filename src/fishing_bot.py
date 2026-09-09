@@ -342,6 +342,9 @@ class FishingBot:
         else:
             self.log("[LURE] Bobber in water. Scanning play area for circular SHAKE prompts...")
 
+        consecutive_reel_frames = 0
+        last_fish_x = None
+
         while self._running:
             elapsed = time.time() - t_start
             if elapsed > max_wait:
@@ -359,8 +362,28 @@ class FishingBot:
             check_img = self.screen.capture_roi(bar_roi_x, bar_roi_y, bar_roi_w, bar_roi_h)
             reel_state = self.detector.analyze_reel_game(check_img)
             if reel_state.is_active:
-                self.log("[LURE] Reel minigame water bar DETECTED! Hooked fish! Transitioning to Reeling...")
-                return True
+                if last_fish_x is None or abs(reel_state.fish_x - last_fish_x) < 80:
+                    consecutive_reel_frames += 1
+                else:
+                    consecutive_reel_frames = 1
+                last_fish_x = reel_state.fish_x
+
+                # Require 3 consecutive frames with consistent fish position to prevent transient misdetections
+                if consecutive_reel_frames >= 3:
+                    self.log(f"[LURE] Reel minigame CONFIRMED (3 frames, fish at {reel_state.fish_x:.0f}px)! Hooked fish! Transitioning to Reeling...")
+                    try:
+                        import os
+                        diag_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scratch")
+                        os.makedirs(diag_dir, exist_ok=True)
+                        check_img.save(os.path.join(diag_dir, "last_reel_transition.png"))
+                    except Exception:
+                        pass
+                    return True
+            else:
+                if consecutive_reel_frames > 0:
+                    self.log(f"[LURE] Deflected transient reel detection ({consecutive_reel_frames}/3 frames). Continuing shake...")
+                consecutive_reel_frames = 0
+                last_fish_x = None
 
             # Determine Shake ROI: Custom Region or Default Water Play Area
             if custom_roi and len(custom_roi) == 4:
