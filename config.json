@@ -23,10 +23,10 @@
       "max_wait_seconds": 25.0,
       "scan_interval": 0.015,
       "custom_roi": [
-        2241,
-        101,
-        1828,
-        1075
+        2243,
+        96,
+        1862,
+        1122
       ]
     },
     "reeling": {

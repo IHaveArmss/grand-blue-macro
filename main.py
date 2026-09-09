@@ -84,6 +84,9 @@ def run_cli():
     rod_slot = config.get("fishing", {}).get("rod_slot", "9")
     print(f"Rod Hotbar Slot: [{rod_slot}]")
     print(f"Hotkeys: [{hk_toggle}] Start/Stop  |  [{hk_calib}] Calibrate  |  [{hk_quit}] Quit")
+    if sys.platform == "darwin":
+        print("[macOS] Reminder: Ensure Terminal/Python has Accessibility & Screen Recording")
+        print("        permissions in System Settings > Privacy & Security.")
     print("==================================================")
 
     screen = ScreenCapture()

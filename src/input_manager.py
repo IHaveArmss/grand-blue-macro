@@ -162,6 +162,15 @@ class WindowsInputManager:
 
     def __init__(self, display_name: Optional[str] = None):
         import ctypes
+        # Ensure consistent DPI scaling with WindowsScreenCapture
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
         self.user32 = ctypes.windll.user32
         self._is_m1_down = False
         self._hotkey_callbacks: Dict[int, Callable[[], None]] = {}
@@ -233,19 +242,22 @@ class WindowsInputManager:
     def press_key(self, key_str: str):
         vk = self._get_vk_code(key_str)
         if vk:
-            self.user32.keybd_event(vk, 0, 0, 0)
+            scan = self.user32.MapVirtualKeyW(vk, 0)
+            self.user32.keybd_event(vk, scan, 0, 0)
 
     def release_key(self, key_str: str):
         vk = self._get_vk_code(key_str)
         if vk:
-            self.user32.keybd_event(vk, 0, self.KEYEVENTF_KEYUP, 0)
+            scan = self.user32.MapVirtualKeyW(vk, 0)
+            self.user32.keybd_event(vk, scan, self.KEYEVENTF_KEYUP, 0)
 
     def tap_key(self, key_str: str, delay: float = 0.05):
         vk = self._get_vk_code(key_str)
         if vk:
-            self.user32.keybd_event(vk, 0, 0, 0)
+            scan = self.user32.MapVirtualKeyW(vk, 0)
+            self.user32.keybd_event(vk, scan, 0, 0)
             time.sleep(delay)
-            self.user32.keybd_event(vk, 0, self.KEYEVENTF_KEYUP, 0)
+            self.user32.keybd_event(vk, scan, self.KEYEVENTF_KEYUP, 0)
 
     def register_hotkey(self, key_name: str, callback: Callable[[], None]):
         vk = self._get_vk_code(key_name)
@@ -301,9 +313,138 @@ class WindowsInputManager:
             self.stop_hotkey_listener()
 
 
+class MacOSInputManager:
+    """High-speed native input simulation and global hotkey manager for macOS using pynput."""
+
+    def __init__(self, display_name: Optional[str] = None):
+        from pynput.mouse import Controller as MouseController, Button
+        from pynput.keyboard import Controller as KeyboardController, Key
+        self.mouse = MouseController()
+        self.keyboard = KeyboardController()
+        self.Button = Button
+        self.Key = Key
+
+        self._is_m1_down = False
+        self._hotkey_callbacks: Dict[str, Callable[[], None]] = {}
+        self._hotkey_listener = None
+        self._running_hotkeys = False
+
+    def mouse_move(self, x: int, y: int, jitter: bool = False):
+        if jitter:
+            self.mouse.position = (int(x) + 1, int(y))
+            time.sleep(0.001)
+        self.mouse.position = (int(x), int(y))
+
+    def mouse_down(self, button: int = 1):
+        if button == 1:
+            self._is_m1_down = True
+            self.mouse.press(self.Button.left)
+        elif button == 2:
+            self.mouse.press(self.Button.right)
+
+    def mouse_up(self, button: int = 1):
+        if button == 1:
+            self._is_m1_down = False
+            self.mouse.release(self.Button.left)
+        elif button == 2:
+            self.mouse.release(self.Button.right)
+
+    def mouse_click(self, x: Optional[int] = None, y: Optional[int] = None, button: int = 1, delay: float = 0.04):
+        if x is not None and y is not None:
+            self.mouse_move(x, y, jitter=True)
+            time.sleep(0.015)
+        self.mouse_down(button)
+        time.sleep(delay)
+        self.mouse_up(button)
+
+    @property
+    def is_m1_down(self) -> bool:
+        return self._is_m1_down
+
+    def release_all(self):
+        if self._is_m1_down:
+            self.mouse_up(1)
+
+    def _get_key_obj(self, key_str: str):
+        k = key_str.upper().strip()
+        if k.startswith("F") and k[1:].isdigit():
+            f_num = int(k[1:])
+            f_attr = f"f{f_num}"
+            if hasattr(self.Key, f_attr):
+                return getattr(self.Key, f_attr)
+        special_map = {
+            "SPACE": self.Key.space, "ENTER": self.Key.enter, "RETURN": self.Key.enter,
+            "ESC": self.Key.esc, "ESCAPE": self.Key.esc, "TAB": self.Key.tab,
+            "SHIFT": self.Key.shift, "CTRL": self.Key.ctrl, "ALT": self.Key.alt
+        }
+        if k in special_map:
+            return special_map[k]
+        if len(key_str) == 1:
+            return key_str.lower()
+        return None
+
+    def press_key(self, key_str: str):
+        key_obj = self._get_key_obj(key_str)
+        if key_obj:
+            self.keyboard.press(key_obj)
+
+    def release_key(self, key_str: str):
+        key_obj = self._get_key_obj(key_str)
+        if key_obj:
+            self.keyboard.release(key_obj)
+
+    def tap_key(self, key_str: str, delay: float = 0.05):
+        key_obj = self._get_key_obj(key_str)
+        if key_obj:
+            self.keyboard.press(key_obj)
+            time.sleep(delay)
+            self.keyboard.release(key_obj)
+
+    def register_hotkey(self, key_name: str, callback: Callable[[], None]):
+        self._hotkey_callbacks[key_name.upper().strip()] = callback
+
+    def _on_key_press(self, key):
+        if not self._running_hotkeys:
+            return
+        key_name = None
+        if hasattr(key, "name") and key.name:
+            key_name = key.name.upper().strip()
+        elif hasattr(key, "char") and key.char:
+            key_name = key.char.upper().strip()
+
+        if key_name and key_name in self._hotkey_callbacks:
+            cb = self._hotkey_callbacks[key_name]
+            threading.Thread(target=cb, daemon=True).start()
+
+    def start_hotkey_listener(self):
+        if self._running_hotkeys:
+            return
+        try:
+            from pynput.keyboard import Listener
+            self._running_hotkeys = True
+            self._hotkey_listener = Listener(on_press=self._on_key_press)
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+        except Exception as e:
+            self._running_hotkeys = False
+            print(f"[InputManager] Warning: Could not start macOS hotkey listener ({e}).")
+            print("[InputManager] Reminder: Grant Accessibility permissions to Terminal/Python in System Settings.")
+
+    def stop_hotkey_listener(self):
+        self._running_hotkeys = False
+        if self._hotkey_listener:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
+            self._hotkey_listener = None
+
+
 # Export platform-appropriate InputManager class
 if sys.platform == "win32":
     InputManager = WindowsInputManager
+elif sys.platform == "darwin":
+    InputManager = MacOSInputManager
 else:
     InputManager = LinuxInputManager
 
