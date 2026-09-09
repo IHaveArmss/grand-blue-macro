@@ -21,6 +21,20 @@ class ReelGameState:
     progress_gain: bool = False  # Whether green progress text is visible
 
 
+@dataclass
+class CastMeterState:
+    detected: bool = False
+    fill_pct: float = 0.0          # 0.0 to 100.0%
+    white_cap_y: Optional[int] = None
+    fill_top_y: Optional[int] = None
+    fill_bot_y: Optional[int] = None
+    dist_px: Optional[int] = None  # Remaining pixels to top white cap
+    total_height: Optional[int] = None
+    mid_x: Optional[int] = None
+    cyan_rows: int = 0
+    white_cap_pixels: int = 0
+
+
 class GrandBlueDetector:
     def __init__(self, templates_dir: str = "pictures"):
         self.templates_dir = templates_dir
@@ -91,55 +105,152 @@ class GrandBlueDetector:
 
     # --- 2. Cast Bar Top Fill Monitor ---
 
-    def check_cast_fill(self, cast_img: Image.Image, fill_threshold: int = 16) -> Tuple[bool, int, int]:
-        """Monitors the vertical cast capsule fill.
-        Detects:
-        1. Glowing white cap at the top of the capsule (>225 RGB).
-        2. Vertical column of cyan liquid rising inside the capsule.
-        Returns (top_reached, cyan_row_count, white_cap_pixels).
+    def analyze_cast_progress(self, cast_img: Image.Image) -> CastMeterState:
+        """Monitors the vertical cast capsule fill, locates the white top cap,
+        measures liquid height, and calculates fill percentage.
         """
         img = cast_img.convert("RGB")
         w, h = img.size
+        raw = img.tobytes()
 
-        cyan_rows = 0
-        white_cap_pixels = 0
-        total_cyan_px = 0
+        # Step 1: Scan for columns containing the cyan liquid
+        col_hits = [0] * w
+        for y in range(0, h, 3):
+            row_off = y * w * 3
+            for x in range(2, w - 2, 2):
+                idx = row_off + x * 3
+                r, g, b = raw[idx], raw[idx + 1], raw[idx + 2]
+                # Cyan liquid fill inside the cast capsule
+                if (r < 150 and g >= 140 and b >= 195 and (g - r) >= 35 and (b - r) >= 55) or \
+                   (r < 235 and g >= 200 and b >= 230 and (g - r) >= 20 and (b - r) >= 20):
+                    col_hits[x] += 1
 
+        active_xs = [x for x, cnt in enumerate(col_hits) if cnt >= 3]
+        if not active_xs:
+            return CastMeterState(detected=False)
+
+        # Step 2: Group into contiguous candidate columns & filter by capsule width
+        components = []
+        curr = [active_xs[0]]
+        for x in active_xs[1:]:
+            if x - curr[-1] <= 6:
+                curr.append(x)
+            else:
+                components.append(curr)
+                curr = [x]
+        components.append(curr)
+
+        valid_caps = []
+        for comp in components:
+            comp_w = comp[-1] - comp[0] + 4
+            # Capsule width is constrained (rejects whole-screen open water)
+            if 8 <= comp_w <= 95:
+                mid_x = (comp[0] + comp[-1]) // 2
+                valid_caps.append((mid_x, comp_w, len(comp)))
+
+        if not valid_caps:
+            return CastMeterState(detected=False)
+
+        # Select candidate with the strongest vertical presence
+        mid_x, comp_w, _ = max(valid_caps, key=lambda c: c[2])
+
+        # Step 3: Vertical sampling along the capsule midline
+        cyan_ys = []
         for y in range(0, h, 2):
-            cyan_in_row = 0
-            white_in_row = 0
-            for x in range(0, w, 2):
-                r, g, b = img.getpixel((x, y))
-                # Cyan fill
-                if 120 < g < 256 and 160 < b < 256 and r < 225:
-                    cyan_in_row += 1
-                    total_cyan_px += 1
-                # Glowing white cap
-                elif r > 225 and g > 225 and b > 225:
-                    white_in_row += 1
+            is_cyan = False
+            for dx in (0, -2, 2):
+                tx = min(w - 1, max(0, mid_x + dx))
+                idx = y * w * 3 + tx * 3
+                r, g, b = raw[idx], raw[idx + 1], raw[idx + 2]
+                if (r < 150 and g >= 140 and b >= 195 and (g - r) >= 35 and (b - r) >= 55) or \
+                   (r < 235 and g >= 200 and b >= 230 and (g - r) >= 20 and (b - r) >= 20):
+                    is_cyan = True
+                    break
+            if is_cyan:
+                cyan_ys.append(y)
 
-            if cyan_in_row >= 5:
-                cyan_rows += 1
-            if white_in_row >= 3:
-                white_cap_pixels += white_in_row
+        if len(cyan_ys) < 3:
+            return CastMeterState(detected=False)
 
-        top_reached = (
-            (white_cap_pixels >= 8 and cyan_rows >= 12) or
-            (cyan_rows >= max(14, fill_threshold)) or
-            (total_cyan_px >= 420)
+        fill_top_y = min(cyan_ys)
+        fill_bot_y = max(cyan_ys)
+
+        # Check dark border flank (when ROI is wider than the capsule itself)
+        if w > comp_w + 12:
+            border_y = (fill_top_y + fill_bot_y) // 2
+            lx = max(0, mid_x - comp_w // 2 - 2)
+            rx = min(w - 1, mid_x + comp_w // 2 + 2)
+            l_dark = raw[border_y * w * 3 + lx * 3] < 85
+            r_dark = raw[border_y * w * 3 + rx * 3] < 85
+            if not (l_dark and r_dark):
+                return CastMeterState(detected=False)
+
+        # Step 4: Scan upward from fill_top_y to locate glowing white top cap
+        white_cap_y = None
+        white_cap_pixels = 0
+        search_limit = max(0, fill_bot_y - 450)
+        for y in range(fill_top_y, search_limit, -1):
+            w_cnt = 0
+            for dx in range(-6, 7, 2):
+                tx = min(w - 1, max(0, mid_x + dx))
+                idx = y * w * 3 + tx * 3
+                r, g, b = raw[idx], raw[idx + 1], raw[idx + 2]
+                if r >= 155 and g >= 165 and b >= 175 and abs(g - r) < 25 and (b - r) < 45:
+                    w_cnt += 1
+            if w_cnt >= 2:
+                white_cap_y = y
+                white_cap_pixels += w_cnt
+                break
+
+        # Step 5: Compute fill percentage and distance to white target
+        if white_cap_y is not None and fill_bot_y > white_cap_y:
+            total_h = fill_bot_y - white_cap_y
+            # Vertical aspect ratio constraint (capsule is tall and narrow)
+            if total_h < 2.0 * comp_w or total_h < 55:
+                return CastMeterState(detected=False)
+            dist_px = max(0, fill_top_y - white_cap_y)
+            fill_pct = max(0.0, min(100.0, (1.0 - (dist_px / total_h)) * 100.0))
+        else:
+            total_h = max(1, fill_bot_y - fill_top_y)
+            # Vertical aspect ratio constraint
+            if total_h < 2.0 * comp_w or total_h < 55:
+                return CastMeterState(detected=False)
+            dist_px = 0
+            fill_pct = 98.0 if len(cyan_ys) >= 30 else 50.0
+
+        return CastMeterState(
+            detected=True,
+            fill_pct=fill_pct,
+            white_cap_y=white_cap_y,
+            fill_top_y=fill_top_y,
+            fill_bot_y=fill_bot_y,
+            dist_px=dist_px,
+            total_height=total_h,
+            mid_x=mid_x,
+            cyan_rows=len(cyan_ys),
+            white_cap_pixels=white_cap_pixels,
         )
-        return top_reached, cyan_rows, white_cap_pixels
 
-    def is_cast_top_reached(self, cast_img: Image.Image, fill_threshold: int = 16) -> bool:
-        reached, _, _ = self.check_cast_fill(cast_img, fill_threshold)
+    def check_cast_fill(self, cast_img: Image.Image, fill_threshold: int = 16, target_pct: float = 92.0) -> Tuple[bool, int, int]:
+        """Monitors the vertical cast capsule fill.
+        Returns (top_reached, cyan_row_count, white_cap_pixels).
+        """
+        state = self.analyze_cast_progress(cast_img)
+        if state.detected:
+            top_reached = (state.fill_pct >= target_pct) or (state.cyan_rows >= max(14, fill_threshold) and state.fill_pct >= 85.0)
+            return top_reached, state.cyan_rows, state.white_cap_pixels
+        return False, 0, 0
+
+    def is_cast_top_reached(self, cast_img: Image.Image, fill_threshold: int = 16, target_pct: float = 92.0) -> bool:
+        reached, _, _ = self.check_cast_fill(cast_img, fill_threshold, target_pct)
         return reached
 
     # --- 3. Shake Button Detection ---
 
     def find_shake_button(self, screen_img: Image.Image,
-                          min_confidence: float = 0.50) -> Optional[Tuple[int, int]]:
+                          min_confidence: float = 0.35) -> Optional[Tuple[int, int]]:
         """Scans image for circular SHAKE prompt buttons with white 'SHAKE' text inside.
-        Rejects HUD numbers, health bars, chat text, or leaderboards, functioning down to 40% scale
+        Rejects HUD numbers, health bars, chat text, or leaderboards, functioning down to 30% scale
         across all backgrounds (water, dock wood, player clothes).
         Returns (center_x, center_y) relative to the input image, or None.
         """
@@ -150,15 +261,15 @@ class GrandBlueDetector:
         # Step 1: Scan for bright neutral text pixels (white/light grey across lighting)
         white_pts = []
         step = 2
-        for y in range(8, h - 8, step):
+        for y in range(4, h - 4, step):
             row_offset = y * w * 3
-            for x in range(8, w - 8, step):
+            for x in range(4, w - 4, step):
                 idx = row_offset + x * 3
                 r, g, b = raw[idx], raw[idx + 1], raw[idx + 2]
-                if r > 195 and g > 195 and b > 195:
+                if r > 185 and g > 185 and b > 185:
                     white_pts.append((x, y))
 
-        if len(white_pts) < 14:
+        if len(white_pts) < 6:
             return None
 
         # Step 2: Cluster white pixels belonging to the word 'SHAKE'
@@ -178,7 +289,7 @@ class GrandBlueDetector:
                 clusters.append([pt[0], pt[1], [pt]])
 
         def is_navy(r: int, g: int, b: int) -> bool:
-            return b > 35 and (b - r > 15) and (b - g > 10) and r < 40 and g < 60
+            return b > 35 and (b - r > 12) and (b - g > 8) and r < 55 and g < 75
 
         best_pt = None
         best_score = 0.0
@@ -192,25 +303,30 @@ class GrandBlueDetector:
             c_h = max(ys) - min(ys)
             aspect = c_w / max(1, c_h)
 
-            # Word 'SHAKE' is a single word: width 20..130, height 4..35, aspect 2.0..5.8, min 14 points
-            # Completely rejects HUD stamina/health bars (which have aspect ratio >= 8.0)
-            if not (20 <= c_w <= 130 and 4 <= c_h <= 35 and 2.0 <= aspect <= 5.8 and len(pts) >= 14):
+            # Word 'SHAKE' is a single word: width 14..140, height 2..40, aspect 1.8..7.5, min 6 points
+            # Completely rejects HUD stamina/health bars (which have aspect ratio >= 8.5)
+            if not (14 <= c_w <= 140 and 2 <= c_h <= 40 and 1.8 <= aspect <= 7.5 and len(pts) >= 6):
                 continue
 
             avg_x = int(cluster[0])
             avg_y = int(cluster[1])
 
-            # Reject extended white bars: if pixels immediately to the left/right of the word are also white,
+            # Reject extended white bars: if pixels beyond the left/right of the word are also white,
             # it is part of an ongoing horizontal UI bar (e.g. stamina bar), not the standalone word 'SHAKE'.
-            dx = int(c_w * 0.65)
-            if avg_x - dx >= 0:
-                lr, lg, lb = img.getpixel((avg_x - dx, avg_y))[:3]
-                if lr > 190 and lg > 190 and lb > 190:
+            margin_x = max(6, int(c_w * 0.2))
+            left_x = min(xs) - margin_x
+            right_x = max(xs) + margin_x
+            if left_x >= 0 and right_x < w:
+                lr, lg, lb = img.getpixel((left_x, avg_y))[:3]
+                rr, rg, rb = img.getpixel((right_x, avg_y))[:3]
+                if (lr > 185 and lg > 185 and lb > 185) and (rr > 185 and rg > 185 and rb > 185):
                     continue
-            if avg_x + dx < w:
-                rr, rg, rb = img.getpixel((avg_x + dx, avg_y))[:3]
-                if rr > 190 and rg > 190 and rb > 190:
-                    continue
+
+            # Dynamic vertical offset scaled to the cluster size (prevents sampling outside distant small disks)
+            dy = max(4, int(1.1 * max(c_h, 5)))
+            top_navy = (avg_y - dy >= 0 and is_navy(*img.getpixel((avg_x, avg_y - dy))[:3]))
+            bot_navy = (avg_y + dy < h and is_navy(*img.getpixel((avg_x, avg_y + dy))[:3]))
+            navy_verified = top_navy or bot_navy
 
             # Primary verification: match against precomputed 'SHAKE' text mask
             if self._shake_tmpl_mask:
@@ -222,10 +338,10 @@ class GrandBlueDetector:
                     for x in range(self._shake_tw):
                         val = resized.getpixel((x, y))
                         if self._shake_tmpl_mask[y * self._shake_tw + x]:
-                            if val > 165:
+                            if val > 150:
                                 score += 1
                         else:
-                            if val > 195:
+                            if val > 185:
                                 penalty += 1.0  # Penalize non-letter white fill
 
                 total_bg = self._shake_th * self._shake_tw - self._shake_white_count
@@ -235,35 +351,21 @@ class GrandBlueDetector:
 
                 match_sc = (score - penalty * 1.0) / self._shake_white_count
 
-                # If mouse cursor partially covers the letters, check navy circular disk
-                navy_verified = False
-                if match_sc >= 0.28:
-                    navy_verified = (
-                        (avg_y - 20 >= 0 and is_navy(*img.getpixel((avg_x, avg_y - 20))[:3])) and
-                        (avg_y + 20 < h and is_navy(*img.getpixel((avg_x, avg_y + 20))[:3]))
-                    )
-
-                is_valid = (match_sc >= min_confidence) or (match_sc >= 0.28 and navy_verified)
+                is_valid = (match_sc >= min_confidence) or (match_sc >= 0.22 and navy_verified)
                 if is_valid and match_sc > best_score:
                     best_score = match_sc
                     best_pt = (avg_x, avg_y)
             else:
                 # Fallback verification: 4-way circular disk checks
-                dy = max(5, int(1.15 * c_h))
-                top_navy = sum(1 for dx in [-int(c_w * 0.25), 0, int(c_w * 0.25)]
-                               if 0 <= avg_x + dx < w and 0 <= avg_y - dy < h
-                               and is_navy(*img.getpixel((avg_x + dx, avg_y - dy))[:3]))
-                bot_navy = sum(1 for dx in [-int(c_w * 0.25), 0, int(c_w * 0.25)]
-                               if 0 <= avg_x + dx < w and 0 <= avg_y + dy < h
-                               and is_navy(*img.getpixel((avg_x + dx, avg_y + dy))[:3]))
+                top_cnt = sum(1 for dx in [-int(c_w * 0.25), 0, int(c_w * 0.25)]
+                              if 0 <= avg_x + dx < w and 0 <= avg_y - dy < h
+                              and is_navy(*img.getpixel((avg_x + dx, avg_y - dy))[:3]))
+                bot_cnt = sum(1 for dx in [-int(c_w * 0.25), 0, int(c_w * 0.25)]
+                              if 0 <= avg_x + dx < w and 0 <= avg_y + dy < h
+                              and is_navy(*img.getpixel((avg_x + dx, avg_y + dy))[:3]))
 
-                if top_navy >= 2 and bot_navy >= 2:
-                    left_navy = sum(1 for ddx in [int(c_w * 0.55), int(c_w * 0.65)]
-                                    if 0 <= avg_x - ddx < w and is_navy(*img.getpixel((avg_x - ddx, avg_y))[:3]))
-                    right_navy = sum(1 for ddx in [int(c_w * 0.55), int(c_w * 0.65)]
-                                     if 0 <= avg_x + ddx < w and is_navy(*img.getpixel((avg_x + ddx, avg_y))[:3]))
-                    if left_navy >= 1 and right_navy >= 1:
-                        return avg_x, avg_y
+                if top_cnt >= 1 and bot_cnt >= 1:
+                    return avg_x, avg_y
 
         return best_pt
 

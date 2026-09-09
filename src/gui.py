@@ -310,6 +310,27 @@ class GrandBlueMacroGUI(Gtk.Window):
         box_mech.set_margin_end(10)
         frame_mech.add(box_mech)
 
+        # Cast target fill & lead time
+        row_cast_pct = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        lbl_cast_pct = Gtk.Label(label="Cast Target Fill (%):")
+        row_cast_pct.pack_start(lbl_cast_pct, False, False, 0)
+        target_pct = self.config.get("fishing", {}).get("cast", {}).get("lead_release_pct", 92.0)
+        self.scale_cast_pct = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 75.0, 98.0, 1.0)
+        self.scale_cast_pct.set_value(target_pct)
+        self.scale_cast_pct.connect("value-changed", self._on_cast_target_pct_changed)
+        row_cast_pct.pack_start(self.scale_cast_pct, True, True, 0)
+        box_mech.pack_start(row_cast_pct, False, False, 0)
+
+        row_cast_lead = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        lbl_cast_lead = Gtk.Label(label="Cast Lead Time (ms):")
+        row_cast_lead.pack_start(lbl_cast_lead, False, False, 0)
+        lead_ms = self.config.get("fishing", {}).get("cast", {}).get("lead_time_ms", 45.0)
+        self.scale_cast_lead = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 120.0, 5.0)
+        self.scale_cast_lead.set_value(lead_ms)
+        self.scale_cast_lead.connect("value-changed", self._on_cast_lead_changed)
+        row_cast_lead.pack_start(self.scale_cast_lead, True, True, 0)
+        box_mech.pack_start(row_cast_lead, False, False, 0)
+
         # Cast max hold
         row_cast = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         lbl_cast = Gtk.Label(label="Cast Max Hold (sec):")
@@ -502,6 +523,16 @@ class GrandBlueMacroGUI(Gtk.Window):
         self.config.setdefault("fishing", {})["assume_rod_equipped_on_start"] = val
         save_config(self.config)
         self._append_log(f"[CONFIG] Assume rod in hand on start set to: {val}")
+
+    def _on_cast_target_pct_changed(self, scale):
+        val = round(scale.get_value(), 1)
+        self.config.setdefault("fishing", {}).setdefault("cast", {})["lead_release_pct"] = val
+        save_config(self.config)
+
+    def _on_cast_lead_changed(self, scale):
+        val = round(scale.get_value(), 1)
+        self.config.setdefault("fishing", {}).setdefault("cast", {})["lead_time_ms"] = val
+        save_config(self.config)
 
     def _on_cast_scale_changed(self, scale):
         val = round(scale.get_value(), 2)

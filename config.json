@@ -12,7 +12,9 @@
     "equip_key_delay": 0.25,
     "cast": {
       "max_hold_time": 1.4,
-      "min_hold_time": 0.25,
+      "min_hold_time": 0.18,
+      "lead_release_pct": 92.0,
+      "lead_time_ms": 45,
       "fill_threshold": 16,
       "check_interval": 0.005
     },

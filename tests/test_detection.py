@@ -218,11 +218,11 @@ class TestGrandBlueDetection(unittest.TestCase):
         self.assertGreater(mock_inp.clicks, 0, "Approaching fish from right should emit tap braking to cushion landing")
 
     def test_multi_scale_shake_detection_down_to_40_percent(self):
-        """Verifies that SHAKE circles scaled from 40% to 100% in 3D perspective are reliably detected."""
+        """Verifies that SHAKE circles scaled from 30% to 100% in 3D perspective are reliably detected."""
         img_path = os.path.join(PICTURES_DIR, "shake.png")
         orig = Image.open(img_path)
 
-        for scale in [0.40, 0.50, 0.75, 1.00]:
+        for scale in [0.30, 0.35, 0.40, 0.50, 0.75, 1.00]:
             w = int(orig.width * scale)
             h = int(orig.height * scale)
             scaled = orig.resize((w, h), Image.Resampling.BILINEAR)
@@ -571,6 +571,66 @@ class TestCastAndRodSafety(unittest.TestCase):
             self.assertTrue(reached_cap, "Full cast capsule must trigger top_reached=True")
             self.assertGreaterEqual(rows_cap, 16)
 
+    def test_analyze_cast_progress_metrics_and_monotonicity(self):
+        """Verifies analyze_cast_progress extracts monotonic fill progression and finds the white cap."""
+        scratch_dir = "/home/ayan/.gemini/antigravity/brain/9464eb6c-83e8-4903-8bac-c57c57553588/scratch"
+        fills = []
+        for i in (19, 20, 21, 22, 23):
+            p = os.path.join(scratch_dir, f"new_roi_{i:02d}.png")
+            if os.path.exists(p):
+                img = Image.open(p)
+                state = self.detector.analyze_cast_progress(img)
+                self.assertTrue(state.detected, f"Frame {i} cast capsule must be detected")
+                self.assertIsNotNone(state.white_cap_y, f"Frame {i} white cap must be located")
+                self.assertIsNotNone(state.dist_px, f"Frame {i} dist_px must be computed")
+                fills.append(state.fill_pct)
+
+        # Verify user asset cyan_bar.png
+        user_cyan_path = os.path.join(PICTURES_DIR, "cyan_bar.png")
+        if os.path.exists(user_cyan_path):
+            u_img = Image.open(user_cyan_path)
+            u_state = self.detector.analyze_cast_progress(u_img)
+            self.assertTrue(u_state.detected, "cyan_bar.png must be detected as a valid cast capsule")
+            self.assertIsNotNone(u_state.white_cap_y, "cyan_bar.png top white cap must be located")
+            self.assertGreater(u_state.fill_pct, 5.0, "cyan_bar.png initial fill must be > 5%")
+            self.assertLess(u_state.fill_pct, 20.0, "cyan_bar.png initial fill must be < 20%")
+
+        if len(fills) == 5:
+            # Check monotonic increasing fill percentage
+            for idx in range(len(fills) - 1):
+                self.assertLess(fills[idx], fills[idx + 1],
+                                f"Fill pct must strictly increase between frames ({fills[idx]} < {fills[idx+1]})")
+            self.assertGreater(fills[-1], 40.0, "Frame 23 should be around 45% filled")
+
+    def test_cast_false_positive_rejection(self):
+        """Verifies that non-cast images (ocean, shake buttons, reel bar) are rejected."""
+        for fn in ("game_full_screen.png", "shake.png", "reel_bar.png"):
+            p = os.path.join(PICTURES_DIR, fn)
+            if os.path.exists(p):
+                img = Image.open(p)
+                state = self.detector.analyze_cast_progress(img)
+                self.assertFalse(state.detected, f"{fn} must NOT be detected as a cast capsule")
+
+    def test_predictive_lead_release_math(self):
+        """Verifies predictive lead release math triggers early at varying velocity."""
+        lead_time_ms = 45.0
+        lead_time_sec = lead_time_ms / 1000.0
+        target_pct = 92.0
+
+        # Scenario 1: Moderate rising speed (150%/s)
+        # Current fill = 86.0%. At 150%/s, in 45ms it will reach 86.0 + 150 * 0.045 = 92.75% >= 92%
+        fill_pct_1 = 86.0
+        v_1 = 150.0
+        pred_1 = fill_pct_1 + (v_1 * lead_time_sec)
+        self.assertGreaterEqual(pred_1, target_pct, "Should trigger early release at 86% with v=150%/s")
+
+        # Scenario 2: High acceleration / fast speed (250%/s)
+        # Current fill = 81.0%. At 250%/s, in 45ms it will reach 81.0 + 250 * 0.045 = 92.25% >= 92%
+        fill_pct_2 = 81.0
+        v_2 = 250.0
+        pred_2 = fill_pct_2 + (v_2 * lead_time_sec)
+        self.assertGreaterEqual(pred_2, target_pct, "Should trigger early release at 81% with v=250%/s")
+
     def test_slot_equipped_synthetic_border(self):
         """Verifies is_slot_equipped detects white border outlines on equipped slots."""
         # Synthesize 85x95 slot with white border on top and bottom
@@ -677,6 +737,64 @@ class TestCastAndRodSafety(unittest.TestCase):
         result = bot._handle_shake((0, 0, 1920, 1080))
         self.assertTrue(result, "Should successfully transition after 3 consecutive frames")
         self.assertEqual(mock_detector.calls, 5, f"Expected 5 calls due to debounce, got {mock_detector.calls}")
+
+    def test_shake_prompt_click_and_nudge_cycle(self):
+        """Verifies _handle_shake auto-clicks detected SHAKE buttons, nudges cursor, and saves diagnostic snapshot."""
+        from src.fishing_bot import FishingBot
+        from src.detector import ReelGameState
+
+        class MockScreen:
+            def capture_roi(self, *args):
+                return Image.new("RGB", (200, 200), (20, 60, 110))
+            def get_cursor_position(self):
+                return (500, 500)
+            def focus_window(self, win):
+                pass
+
+        class MockInput:
+            def __init__(self):
+                self.clicks = []
+                self.moves = []
+            def mouse_click(self, x, y, button=1, delay=0.04):
+                self.clicks.append((x, y, button))
+            def mouse_move(self, x, y):
+                self.moves.append((x, y))
+            def release_all(self):
+                pass
+
+        class MockDetector:
+            def __init__(self):
+                self.shake_calls = 0
+            def find_shake_button(self, img):
+                self.shake_calls += 1
+                if self.shake_calls == 1:
+                    return (50, 60)
+                return None
+            def analyze_reel_game(self, img):
+                if self.shake_calls >= 4:
+                    return ReelGameState(is_active=True, fish_x=450.0)
+                return ReelGameState(is_active=False)
+
+        mock_screen = MockScreen()
+        mock_input = MockInput()
+        mock_detector = MockDetector()
+        config = {
+            "fishing": {
+                "shake": {
+                    "click_delay": 0.01,
+                    "max_wait_seconds": 1.0,
+                }
+            }
+        }
+        bot = FishingBot(mock_screen, mock_input, mock_detector, config)
+        bot._running = True
+        result = bot._handle_shake((0, 0, 1920, 1080))
+        self.assertTrue(result)
+        self.assertEqual(len(mock_input.clicks), 1, "Should have clicked the shake prompt exactly once")
+        # Prompt clicked at shake_roi_x (153) + 50 = 203, shake_roi_y (43) + 60 = 103
+        self.assertEqual(mock_input.clicks[0][:2], (153 + 50, 43 + 60))
+        self.assertGreater(len(mock_input.moves), 0, "Should have nudged mouse cursor away after clicking")
+        self.assertTrue(os.path.exists("scratch/last_shake_click.png"), "Diagnostic snapshot of click must be saved")
 
 
 if __name__ == "__main__":

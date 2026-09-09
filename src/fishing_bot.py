@@ -1,5 +1,6 @@
 """Main state machine and autonomous loop for Grand Blue fishing with detailed state logging."""
 
+import os
 import time
 import threading
 from typing import Optional, Callable
@@ -234,13 +235,17 @@ class FishingBot:
 
     def _handle_cast(self, game_rect) -> bool:
         """Holds M1 and releases when the vertical meter fills to the top.
+        Uses real-time velocity tracking and predictive lead release to compensate
+        for input and rendering latency before overshooting the top white cap.
         Returns True if cast was successful (meter detected and released), False otherwise.
         """
         self.set_status("CASTING")
         cast_cfg = self.config.get("fishing", {}).get("cast", {})
         max_hold = cast_cfg.get("max_hold_time", 1.4)
-        min_hold = cast_cfg.get("min_hold_time", 0.25)
-        fill_thresh = cast_cfg.get("fill_threshold", 16)
+        min_hold = cast_cfg.get("min_hold_time", 0.18)
+        target_fill_pct = float(cast_cfg.get("lead_release_pct", 92.0))
+        lead_time_ms = float(cast_cfg.get("lead_time_ms", 45.0))
+        lead_time_sec = max(0.0, lead_time_ms / 1000.0)
 
         gx, gy, gw, gh = game_rect
         center_x = gx + (gw // 2)
@@ -263,61 +268,118 @@ class FishingBot:
         else:
             self.log(f"[CAST] Mouse positioned at ({cx}, {cy}). Charging cast (holding M1)...")
 
-        # Cast ROI: vertical strip where cast capsule appears
-        cast_roi_x = gx + int(0.38 * gw)
+        # Cast ROI: generously covers 40% to 75% of window width and 18% to 83% of height
+        # Grand Blue's cast capsule sits at ~62% of window width on the right of the character
+        cast_roi_x = gx + int(0.40 * gw)
         cast_roi_y = gy + int(0.18 * gh)
-        cast_roi_w = int(0.24 * gw)
-        cast_roi_h = int(0.62 * gh)
+        cast_roi_w = int(0.35 * gw)
+        cast_roi_h = int(0.65 * gh)
 
         t_start = time.time()
         self.input.mouse_down(1)
         last_log_t = 0.0
-        best_fill = 0
-        stable_count = 0
+        best_fill_pct = 0.0
         cast_success = False
+        first_detect_saved = False
+
+        # Velocity tracking: v = d(fill_pct) / dt (% per second)
+        last_t = t_start
+        last_pct = 0.0
+        fill_velocity = 0.0
 
         while self._running:
-            elapsed = time.time() - t_start
+            now = time.time()
+            elapsed = now - t_start
             if elapsed >= max_hold:
-                if best_fill >= 8:
-                    self.log(f"[CAST] Reached max hold time ({max_hold}s) with fill={best_fill}. Releasing M1.")
+                if best_fill_pct >= 30.0:
+                    self.log(f"[CAST] Max hold time reached ({max_hold:.2f}s) with best fill={best_fill_pct:.1f}%. Releasing M1.")
                     cast_success = True
                 else:
-                    self.log(f"[CAST] Max hold time ({max_hold}s) reached with NO cast meter detected (best={best_fill}). Releasing M1.")
+                    self.log(f"[CAST] Max hold time ({max_hold:.2f}s) reached with NO cast meter detected (best={best_fill_pct:.1f}%). Releasing M1.")
                     cast_success = False
                 break
 
             cast_crop = self.screen.capture_roi(cast_roi_x, cast_roi_y, cast_roi_w, cast_roi_h)
-            reached, cyan_rows, white_px = self.detector.check_cast_fill(cast_crop, fill_thresh)
+            state = self.detector.analyze_cast_progress(cast_crop)
 
-            if elapsed >= min_hold:
-                if reached:
-                    self.log(f"[CAST] Top of meter REACHED (cyan_rows={cyan_rows}, white_cap={white_px})! Releasing M1.")
-                    cast_success = True
-                    break
-                if cyan_rows > best_fill:
-                    best_fill = cyan_rows
-                    stable_count = 0
-                elif best_fill >= 14:
-                    stable_count += 1
-                    if stable_count >= 3:
-                        self.log(f"[CAST] Cast meter reached peak ({best_fill} rows)! Releasing M1.")
+            if state.detected:
+                # Diagnostic snapshot on initial detection for visual verification
+                if not first_detect_saved:
+                    first_detect_saved = True
+                    try:
+                        os.makedirs("scratch", exist_ok=True)
+                        cast_crop.save("scratch/last_cast_detected.png")
+                    except Exception:
+                        pass
+
+                # Calculate rising velocity
+                dt = now - last_t
+                if dt >= 0.012:
+                    instant_v = (state.fill_pct - last_pct) / dt
+                    if instant_v > 0:
+                        fill_velocity = 0.7 * instant_v + 0.3 * fill_velocity
+                    last_pct = state.fill_pct
+                    last_t = now
+
+                # Predictive fill level accounting for lead latency
+                predicted_fill = state.fill_pct + (fill_velocity * lead_time_sec)
+                if state.fill_pct > best_fill_pct:
+                    best_fill_pct = state.fill_pct
+
+                if elapsed >= min_hold:
+                    # Trigger 1: Predictive lead release (rising velocity will reach target within lead_time_ms)
+                    if predicted_fill >= target_fill_pct:
+                        self.log(
+                            f"[CAST] Lead release triggered! Current fill={state.fill_pct:.1f}%, "
+                            f"velocity={fill_velocity:.1f}%/s, predicted={predicted_fill:.1f}% "
+                            f"(target={target_fill_pct:.1f}%, lead={lead_time_ms:.0f}ms). Releasing M1."
+                        )
                         cast_success = True
+                        try:
+                            os.makedirs("scratch", exist_ok=True)
+                            cast_crop.save("scratch/last_cast_release.png")
+                        except Exception:
+                            pass
                         break
 
-            if elapsed - last_log_t > 0.25:
-                if cyan_rows > 0 or white_px > 0:
-                    self.log(f"[CAST] Meter rising... cyan_rows={cyan_rows}, white_cap={white_px} (elapsed: {elapsed:.2f}s).")
+                    # Trigger 2: Direct target fill reach
+                    if state.fill_pct >= target_fill_pct:
+                        self.log(f"[CAST] Target fill REACHED ({state.fill_pct:.1f}% >= {target_fill_pct:.1f}%)! Releasing M1.")
+                        cast_success = True
+                        try:
+                            os.makedirs("scratch", exist_ok=True)
+                            cast_crop.save("scratch/last_cast_release.png")
+                        except Exception:
+                            pass
+                        break
+
+                    # Trigger 3: Peak / reversal detection (meter reached top and bounced down)
+                    if best_fill_pct >= 75.0 and state.fill_pct < (best_fill_pct - 3.5):
+                        self.log(f"[CAST] Peak reversal detected ({best_fill_pct:.1f}% -> {state.fill_pct:.1f}%)! Releasing M1.")
+                        cast_success = True
+                        try:
+                            os.makedirs("scratch", exist_ok=True)
+                            cast_crop.save("scratch/last_cast_release.png")
+                        except Exception:
+                            pass
+                        break
+
+            if elapsed - last_log_t > 0.20:
+                if state.detected and state.fill_pct > 0:
+                    self.log(
+                        f"[CAST] Meter rising... fill={state.fill_pct:.1f}% "
+                        f"(dist={state.dist_px}px, v={fill_velocity:.1f}%/s, elapsed={elapsed:.2f}s)."
+                    )
                 last_log_t = elapsed
 
-            time.sleep(0.008)
+            time.sleep(0.005)
 
         self.input.mouse_up(1)
 
-        if cast_success or best_fill >= 8:
+        if cast_success or best_fill_pct >= 30.0:
             self._rod_equipped = True
-            self.log("[CAST] Cast released! Waiting 0.6s for bobber to splash in water...")
-            time.sleep(0.6)
+            self.log(f"[CAST] Cast released at {best_fill_pct:.1f}%! Entering lure phase immediately...")
+            time.sleep(0.04)
             return True
         else:
             self.log("[CAST] Warning: No cast meter appeared during M1 hold! Rod may not be equipped. Aborting to re-equip.")
@@ -353,13 +415,59 @@ class FishingBot:
 
             scan_count += 1
 
-            # Check if reel minigame has started
-            bar_roi_x = gx + int(0.15 * gw)
-            bar_roi_y = gy + int(0.40 * gh)
-            bar_roi_w = int(0.70 * gw)
-            bar_roi_h = int(0.45 * gh)
+            # Determine Shake ROI: Custom Region or Default Water Play Area
+            if custom_roi and len(custom_roi) == 4:
+                shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h = [int(v) for v in custom_roi]
+                play_img = self.screen.capture_roi(shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h)
+            else:
+                shake_roi_x = gx + int(0.08 * gw)
+                shake_roi_y = gy + int(0.04 * gh)
+                shake_roi_w = int(0.90 * gw)
+                shake_roi_h = int(0.89 * gh)
+                play_img = self.screen.capture_roi(shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h)
 
-            check_img = self.screen.capture_roi(bar_roi_x, bar_roi_y, bar_roi_w, bar_roi_h)
+            # Step 1: Check for circular SHAKE prompts (highest priority - click immediately upon spawning!)
+            shake_pt = self.detector.find_shake_button(play_img)
+            if shake_pt:
+                click_x = shake_roi_x + shake_pt[0]
+                click_y = shake_roi_y + shake_pt[1]
+                self.log(f"[LURE] SHAKE circle DETECTED at ({click_x}, {click_y})! Auto-clicking center...")
+                self.input.mouse_click(click_x, click_y, button=1, delay=click_delay)
+                # Diagnostic snapshot of the clicked prompt
+                try:
+                    import os
+                    from PIL import ImageDraw
+                    os.makedirs("scratch", exist_ok=True)
+                    click_vis = play_img.copy()
+                    draw = ImageDraw.Draw(click_vis)
+                    px, py = shake_pt
+                    draw.ellipse([px - 15, py - 15, px + 15, py + 15], outline=(0, 255, 0), width=3)
+                    click_vis.save("scratch/last_shake_click.png")
+                except Exception:
+                    pass
+                # Immediately nudge mouse cursor away so subsequent prompts in the same spot are never occluded!
+                self.input.mouse_move(click_x + 60, click_y + 40)
+                time.sleep(0.10)  # Quick debounce so subsequent prompts are clicked immediately
+                continue
+
+            # Step 2: Check if reel minigame has started
+            if custom_roi and len(custom_roi) == 4:
+                bar_roi_x = gx + int(0.15 * gw)
+                bar_roi_y = gy + int(0.40 * gh)
+                bar_roi_w = int(0.70 * gw)
+                bar_roi_h = int(0.45 * gh)
+                check_img = self.screen.capture_roi(bar_roi_x, bar_roi_y, bar_roi_w, bar_roi_h)
+            else:
+                rel_x = (gx + int(0.15 * gw)) - shake_roi_x
+                rel_y = (gy + int(0.40 * gh)) - shake_roi_y
+                rel_w = int(0.70 * gw)
+                rel_h = int(0.45 * gh)
+                c_x1 = max(0, min(rel_x, play_img.width - 1))
+                c_y1 = max(0, min(rel_y, play_img.height - 1))
+                c_x2 = max(c_x1 + 1, min(c_x1 + rel_w, play_img.width))
+                c_y2 = max(c_y1 + 1, min(c_y1 + rel_h, play_img.height))
+                check_img = play_img.crop((c_x1, c_y1, c_x2, c_y2))
+
             reel_state = self.detector.analyze_reel_game(check_img)
             if reel_state.is_active:
                 if last_fish_x is None or abs(reel_state.fish_x - last_fish_x) < 80:
@@ -385,31 +493,16 @@ class FishingBot:
                 consecutive_reel_frames = 0
                 last_fish_x = None
 
-            # Determine Shake ROI: Custom Region or Default Water Play Area
-            if custom_roi and len(custom_roi) == 4:
-                shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h = [int(v) for v in custom_roi]
-            else:
-                shake_roi_x = gx + int(0.08 * gw)
-                shake_roi_y = gy + int(0.04 * gh)
-                shake_roi_w = int(0.90 * gw)
-                shake_roi_h = int(0.89 * gh)
-
-            shake_crop = self.screen.capture_roi(shake_roi_x, shake_roi_y, shake_roi_w, shake_roi_h)
-            shake_pt = self.detector.find_shake_button(shake_crop)
-
-            if shake_pt:
-                click_x = shake_roi_x + shake_pt[0]
-                click_y = shake_roi_y + shake_pt[1]
-                self.log(f"[LURE] SHAKE circle DETECTED at ({click_x}, {click_y})! Auto-clicking center...")
-                self.input.mouse_click(click_x, click_y, button=1, delay=click_delay)
-                # Immediately nudge mouse cursor away so subsequent prompts in the same spot are never occluded!
-                self.input.mouse_move(click_x + 60, click_y + 40)
-                time.sleep(0.12)  # Quick debounce so subsequent prompts are clicked immediately
-            else:
-                if elapsed - last_log_t > 2.0:
-                    self.log(f"[LURE] SHAKE prompt NOT detected yet (scan #{scan_count}, elapsed: {elapsed:.1f}s). Waiting...")
-                    last_log_t = elapsed
-                time.sleep(0.012)
+            if elapsed - last_log_t > 2.0:
+                self.log(f"[LURE] SHAKE prompt NOT detected yet (scan #{scan_count}, elapsed: {elapsed:.1f}s). Waiting...")
+                last_log_t = elapsed
+                try:
+                    import os
+                    os.makedirs("scratch", exist_ok=True)
+                    play_img.save("scratch/last_shake_scan.png")
+                except Exception:
+                    pass
+            time.sleep(0.010)
 
         return False
 
